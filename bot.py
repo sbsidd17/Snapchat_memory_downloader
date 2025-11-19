@@ -258,38 +258,33 @@ class SnapchatMemoryProcessor:
         
         return '\n'.join(caption_parts)
 
-class SnapchatBot:
-    def __init__(self, token: str, webhook_url: str = None):
-        self.token = token
-        self.webhook_url = webhook_url
-        
-        # Configure application with longer timeouts
-        builder = Application.builder().token(token)
-        builder.connect_timeout(60)
-        builder.read_timeout(60)
-        builder.write_timeout(60)
-        builder.pool_timeout(60)
-        
-        self.application = builder.build()
-        self.processor = SnapchatMemoryProcessor()
-        
-        # Add handlers
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("stop", self.stop_command))
-        self.application.add_handler(CommandHandler("status", self.status_command))
-        self.application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+# Create Flask app first
+app = Flask(__name__)
 
-    def get_user_session(self, user_id: int) -> UserSession:
-        """Get or create user session"""
-        if user_id not in user_sessions:
-            user_sessions[user_id] = UserSession(user_id)
-        return user_sessions[user_id]
+# Initialize bot application
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send welcome message when command /start is issued."""
-        welcome_text = """
+# Configure application with longer timeouts
+builder = Application.builder().token(BOT_TOKEN)
+builder.connect_timeout(60)
+builder.read_timeout(60)
+builder.write_timeout(60)
+builder.pool_timeout(60)
+
+application = builder.build()
+processor = SnapchatMemoryProcessor()
+
+def get_user_session(user_id: int) -> UserSession:
+    """Get or create user session"""
+    if user_id not in user_sessions:
+        user_sessions[user_id] = UserSession(user_id)
+    return user_sessions[user_id]
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send welcome message when command /start is issued."""
+    welcome_text = """
 🤖 *Snapchat Memories Bot*
 
 I can help you backup your Snapchat memories to Telegram!
@@ -307,12 +302,12 @@ I can help you backup your Snapchat memories to Telegram!
 /status - Check current progress
 
 ⚠️ *Note:* Download links expire after 7 days, so use fresh data exports.
-        """
-        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    """
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send help message when command /help is issued."""
-        help_text = """
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send help message when command /help is issued."""
+    help_text = """
 📖 *Help Guide*
 
 *Steps to get your Snapchat data:*
@@ -332,36 +327,36 @@ I can help you backup your Snapchat memories to Telegram!
 ✅ Year-wise organization
 
 *Privacy:* Files are processed temporarily and not stored.
-        """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+    """
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
-    async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Stop current processing"""
-        user_session = self.get_user_session(update.effective_user.id)
-        
-        if not user_session.is_processing:
-            await update.message.reply_text("ℹ️ No active process to stop.")
-            return
-        
-        user_session.should_stop = True
-        await update.message.reply_text("🛑 Stopping process... Please wait.")
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop current processing"""
+    user_session = get_user_session(update.effective_user.id)
+    
+    if not user_session.is_processing:
+        await update.message.reply_text("ℹ️ No active process to stop.")
+        return
+    
+    user_session.should_stop = True
+    await update.message.reply_text("🛑 Stopping process... Please wait.")
 
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Check current status"""
-        user_session = self.get_user_session(update.effective_user.id)
-        
-        if not user_session.is_processing or user_session.processed_count == 0:
-            await update.message.reply_text("ℹ️ No active process running.")
-            return
-        
-        elapsed = time.time() - user_session.start_time
-        progress = user_session.processed_count
-        total = len(user_session.memories)
-        success = user_session.success_count
-        failed = user_session.failed_count
-        percentage = (progress / total) * 100 if total > 0 else 0
-        
-        status_text = f"""
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check current status"""
+    user_session = get_user_session(update.effective_user.id)
+    
+    if not user_session.is_processing or user_session.processed_count == 0:
+        await update.message.reply_text("ℹ️ No active process running.")
+        return
+    
+    elapsed = time.time() - user_session.start_time
+    progress = user_session.processed_count
+    total = len(user_session.memories)
+    success = user_session.success_count
+    failed = user_session.failed_count
+    percentage = (progress / total) * 100 if total > 0 else 0
+    
+    status_text = f"""
 📊 *Current Status*
 
 🔢 Progress: {progress}/{total} ({percentage:.1f}%)
@@ -371,219 +366,219 @@ I can help you backup your Snapchat memories to Telegram!
 📁 Current: {user_session.current_file or 'None'}
 
 🛑 Use /stop to cancel
-        """
-        await update.message.reply_text(status_text, parse_mode='Markdown')
+    """
+    await update.message.reply_text(status_text, parse_mode='Markdown')
 
-    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle received document (HTML file)."""
-        user_session = self.get_user_session(update.effective_user.id)
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle received document (HTML file)."""
+    user_session = get_user_session(update.effective_user.id)
+    
+    if user_session.is_processing:
+        await update.message.reply_text("⚠️ Please wait for current process to complete or use /stop to cancel.")
+        return
+
+    document = update.message.document
+    
+    # Check if it's an HTML file
+    if not document.file_name.lower().endswith('.html'):
+        await update.message.reply_text("❌ Please send an HTML file from Snapchat data export.")
+        return
+
+    # Download and process the file
+    file = await context.bot.get_file(document.file_id)
+    temp_path = None
+    
+    try:
+        with tempfile.NamedTemporaryFile(mode='w+b', suffix='.html', delete=False) as temp_file:
+            temp_path = temp_file.name
         
-        if user_session.is_processing:
-            await update.message.reply_text("⚠️ Please wait for current process to complete or use /stop to cancel.")
+        await file.download_to_drive(temp_path)
+        
+        with open(temp_path, 'r', encoding='utf-8') as f:
+            html_content = f.read()
+        
+        # Process the HTML file
+        await process_snapchat_file(html_content, update, context, user_session)
+        
+    except Exception as e:
+        logger.error(f"Error handling document: {e}")
+        await update.message.reply_text(f"❌ Error processing file: {str(e)}")
+    finally:
+        # Clean up temp file
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages."""
+    user_session = get_user_session(update.effective_user.id)
+    
+    # Check if this is a confirmation for large files
+    if user_session.memories and len(user_session.memories) > 100:
+        if update.message.text.lower() in ['yes', 'y', 'continue']:
+            await start_upload_process(update, context, user_session)
             return
-
-        document = update.message.document
-        
-        # Check if it's an HTML file
-        if not document.file_name.lower().endswith('.html'):
-            await update.message.reply_text("❌ Please send an HTML file from Snapchat data export.")
-            return
-
-        # Download and process the file
-        file = await context.bot.get_file(document.file_id)
-        temp_path = None
-        
-        try:
-            with tempfile.NamedTemporaryFile(mode='w+b', suffix='.html', delete=False) as temp_file:
-                temp_path = temp_file.name
-            
-            await file.download_to_drive(temp_path)
-            
-            with open(temp_path, 'r', encoding='utf-8') as f:
-                html_content = f.read()
-            
-            # Process the HTML file
-            await self.process_snapchat_file(html_content, update, context, user_session)
-            
-        except Exception as e:
-            logger.error(f"Error handling document: {e}")
-            await update.message.reply_text(f"❌ Error processing file: {str(e)}")
-        finally:
-            # Clean up temp file
-            if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path)
-
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle text messages."""
-        user_session = self.get_user_session(update.effective_user.id)
-        
-        # Check if this is a confirmation for large files
-        if user_session.memories and len(user_session.memories) > 100:
-            if update.message.text.lower() in ['yes', 'y', 'continue']:
-                await self.start_upload_process(update, context, user_session)
-                return
-            elif update.message.text.lower() in ['no', 'n', 'stop', 'cancel']:
-                await update.message.reply_text("❌ Process cancelled.")
-                user_session.reset()
-                return
-        
-        await update.message.reply_text(
-            "Please send me the HTML file you received from Snapchat data export.\n"
-            "Use /help for instructions on how to get your data."
-        )
-
-    async def process_snapchat_file(self, html_content: str, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession):
-        """Process the Snapchat HTML file and show statistics"""
-        try:
-            # Step 1: Parse HTML
-            parsing_msg = await update.message.reply_text("🔍 Analyzing your Snapchat data file...")
-            
-            user_session.memories = self.processor.parse_html_file(html_content)
-            
-            if not user_session.memories:
-                await parsing_msg.edit_text("❌ No memories found in the HTML file. Please make sure it's a valid Snapchat data export.")
-                return
-            
-            # Step 2: Show statistics
-            stats = self.processor.analyze_memories(user_session.memories)
-            stats_text = self.format_statistics(stats)
-            
-            await parsing_msg.edit_text(stats_text)
-            
-            # Ask for confirmation for large files
-            if stats['total'] > 100:
-                confirm_msg = await update.message.reply_text(
-                    f"⚠️ Found {stats['total']} memories. This may take a while.\n"
-                    "Reply 'yes' to continue or 'no' to cancel."
-                )
-            else:
-                # Start immediately for small files
-                await self.start_upload_process(update, context, user_session)
-            
-        except Exception as e:
-            logger.error(f"Error in process_snapchat_file: {e}")
-            await update.message.reply_text(f"❌ Unexpected error: {str(e)}")
-
-    async def start_upload_process(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession):
-        """Start the upload process"""
-        user_session.is_processing = True
-        user_session.should_stop = False
-        user_session.start_time = time.time()
-        
-        try:
-            # Step 3: Start processing
-            progress_msg = await update.message.reply_text(
-                "⏳ Starting upload process...\n\n"
-                "🛑 Use /stop to cancel anytime\n"
-                "📊 Use /status to check progress\n\n"
-                "⏰ This may take a while for large collections..."
-            )
-            user_session.processing_message = progress_msg
-            
-            # Create temporary directory for downloads
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Process memories one by one
-                await self.process_memories_sequential(update, context, user_session, temp_dir)
-            
-            # Final summary
-            await self.send_final_summary(update, user_session)
-            
-        except Exception as e:
-            logger.error(f"Error in start_upload_process: {e}")
-            await update.message.reply_text(f"❌ Unexpected error: {str(e)}")
-        finally:
+        elif update.message.text.lower() in ['no', 'n', 'stop', 'cancel']:
+            await update.message.reply_text("❌ Process cancelled.")
             user_session.reset()
+            return
+    
+    await update.message.reply_text(
+        "Please send me the HTML file you received from Snapchat data export.\n"
+        "Use /help for instructions on how to get your data."
+    )
 
-    async def process_memories_sequential(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession, temp_dir: str):
-        """Process memories one by one with proper tracking"""
-        total_memories = len(user_session.memories)
+async def process_snapchat_file(html_content: str, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession):
+    """Process the Snapchat HTML file and show statistics"""
+    try:
+        # Step 1: Parse HTML
+        parsing_msg = await update.message.reply_text("🔍 Analyzing your Snapchat data file...")
         
-        # Create a single HTTP session for all requests
-        async with aiohttp.ClientSession() as session:
-            for i, memory in enumerate(user_session.memories):
-                if user_session.should_stop:
-                    await update.message.reply_text("🛑 Process stopped by user.")
-                    break
+        user_session.memories = processor.parse_html_file(html_content)
+        
+        if not user_session.memories:
+            await parsing_msg.edit_text("❌ No memories found in the HTML file. Please make sure it's a valid Snapchat data export.")
+            return
+        
+        # Step 2: Show statistics
+        stats = processor.analyze_memories(user_session.memories)
+        stats_text = format_statistics(stats)
+        
+        await parsing_msg.edit_text(stats_text)
+        
+        # Ask for confirmation for large files
+        if stats['total'] > 100:
+            confirm_msg = await update.message.reply_text(
+                f"⚠️ Found {stats['total']} memories. This may take a while.\n"
+                "Reply 'yes' to continue or 'no' to cancel."
+            )
+        else:
+            # Start immediately for small files
+            await start_upload_process(update, context, user_session)
+        
+    except Exception as e:
+        logger.error(f"Error in process_snapchat_file: {e}")
+        await update.message.reply_text(f"❌ Unexpected error: {str(e)}")
+
+async def start_upload_process(update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession):
+    """Start the upload process"""
+    user_session.is_processing = True
+    user_session.should_stop = False
+    user_session.start_time = time.time()
+    
+    try:
+        # Step 3: Start processing
+        progress_msg = await update.message.reply_text(
+            "⏳ Starting upload process...\n\n"
+            "🛑 Use /stop to cancel anytime\n"
+            "📊 Use /status to check progress\n\n"
+            "⏰ This may take a while for large collections..."
+        )
+        user_session.processing_message = progress_msg
+        
+        # Create temporary directory for downloads
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Process memories one by one
+            await process_memories_sequential(update, context, user_session, temp_dir)
+        
+        # Final summary
+        await send_final_summary(update, user_session)
+        
+    except Exception as e:
+        logger.error(f"Error in start_upload_process: {e}")
+        await update.message.reply_text(f"❌ Unexpected error: {str(e)}")
+    finally:
+        user_session.reset()
+
+async def process_memories_sequential(update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession, temp_dir: str):
+    """Process memories one by one with proper tracking"""
+    total_memories = len(user_session.memories)
+    
+    # Create a single HTTP session for all requests
+    async with aiohttp.ClientSession() as session:
+        for i, memory in enumerate(user_session.memories):
+            if user_session.should_stop:
+                await update.message.reply_text("🛑 Process stopped by user.")
+                break
+            
+            user_session.current_index = i + 1
+            user_session.current_file = f"{memory['date']} ({memory['media_type']})"
+            
+            # Update progress
+            await update_progress_message(user_session, update)
+            
+            # Download memory
+            downloaded_memory = await processor.download_memory(session, memory, temp_dir)
+            
+            if downloaded_memory:
+                # Upload to Telegram
+                success = await processor.upload_to_telegram(downloaded_memory, update, context)
                 
-                user_session.current_index = i + 1
-                user_session.current_file = f"{memory['date']} ({memory['media_type']})"
-                
-                # Update progress
-                await self.update_progress_message(user_session, update)
-                
-                # Download memory
-                downloaded_memory = await self.processor.download_memory(session, memory, temp_dir)
-                
-                if downloaded_memory:
-                    # Upload to Telegram
-                    success = await self.processor.upload_to_telegram(downloaded_memory, update, context)
-                    
-                    if success:
-                        user_session.success_count += 1
-                        # Update stats
-                        if 'image' in memory['media_type']:
-                            user_session.stats['images'] += 1
-                        elif 'video' in memory['media_type']:
-                            user_session.stats['videos'] += 1
-                        else:
-                            user_session.stats['other'] += 1
+                if success:
+                    user_session.success_count += 1
+                    # Update stats
+                    if 'image' in memory['media_type']:
+                        user_session.stats['images'] += 1
+                    elif 'video' in memory['media_type']:
+                        user_session.stats['videos'] += 1
                     else:
-                        user_session.failed_count += 1
-                        user_session.failed_memories.append(memory)
-                        logger.error(f"Failed to upload: {memory['date']}")
+                        user_session.stats['other'] += 1
                 else:
                     user_session.failed_count += 1
                     user_session.failed_memories.append(memory)
-                    logger.error(f"Failed to download: {memory['date']}")
-                
-                user_session.processed_count += 1
-                
-                # Small delay to avoid rate limits (random between 1-3 seconds)
-                await asyncio.sleep(random.uniform(1, 3))
-                
-                # Clean up downloaded file
-                if downloaded_memory and 'filepath' in downloaded_memory:
-                    try:
-                        os.unlink(downloaded_memory['filepath'])
-                    except:
-                        pass
-
-    async def update_progress_message(self, user_session: UserSession, update: Update):
-        """Update progress message"""
-        if not user_session.processing_message:
-            return
+                    logger.error(f"Failed to upload: {memory['date']}")
+            else:
+                user_session.failed_count += 1
+                user_session.failed_memories.append(memory)
+                logger.error(f"Failed to download: {memory['date']}")
             
-        current = user_session.current_index
-        total = len(user_session.memories)
-        success = user_session.success_count
-        failed = user_session.failed_count
-        percentage = (current / total) * 100 if total > 0 else 0
-        
-        progress_text = (
-            f"📤 Uploading memories...\n\n"
-            f"🔢 Progress: {current}/{total} ({percentage:.1f}%)\n"
-            f"✅ Successful: {success}\n"
-            f"❌ Failed: {failed}\n"
-            f"📊 Images: {user_session.stats['images']} | Videos: {user_session.stats['videos']}\n"
-            f"📁 Current: {user_session.current_file}\n\n"
-            f"🛑 Use /stop to cancel\n"
-            f"📊 Use /status for details"
-        )
-        
-        try:
-            await user_session.processing_message.edit_text(progress_text)
-        except Exception as e:
-            logger.warning(f"Could not update progress message: {e}")
+            user_session.processed_count += 1
+            
+            # Small delay to avoid rate limits (random between 1-3 seconds)
+            await asyncio.sleep(random.uniform(1, 3))
+            
+            # Clean up downloaded file
+            if downloaded_memory and 'filepath' in downloaded_memory:
+                try:
+                    os.unlink(downloaded_memory['filepath'])
+                except:
+                    pass
 
-    def format_statistics(self, stats: Dict) -> str:
-        """Format statistics for display"""
-        years_text = ""
-        if stats['years']:
-            years_sorted = sorted(stats['years'].items(), key=lambda x: x[0])
-            years_list = [f"{year}: {count}" for year, count in years_sorted]
-            years_text = f"📅 Years: {', '.join(years_list)}\n"
+async def update_progress_message(user_session: UserSession, update: Update):
+    """Update progress message"""
+    if not user_session.processing_message:
+        return
         
-        return f"""
+    current = user_session.current_index
+    total = len(user_session.memories)
+    success = user_session.success_count
+    failed = user_session.failed_count
+    percentage = (current / total) * 100 if total > 0 else 0
+    
+    progress_text = (
+        f"📤 Uploading memories...\n\n"
+        f"🔢 Progress: {current}/{total} ({percentage:.1f}%)\n"
+        f"✅ Successful: {success}\n"
+        f"❌ Failed: {failed}\n"
+        f"📊 Images: {user_session.stats['images']} | Videos: {user_session.stats['videos']}\n"
+        f"📁 Current: {user_session.current_file}\n\n"
+        f"🛑 Use /stop to cancel\n"
+        f"📊 Use /status for details"
+    )
+    
+    try:
+        await user_session.processing_message.edit_text(progress_text)
+    except Exception as e:
+        logger.warning(f"Could not update progress message: {e}")
+
+def format_statistics(stats: Dict) -> str:
+    """Format statistics for display"""
+    years_text = ""
+    if stats['years']:
+        years_sorted = sorted(stats['years'].items(), key=lambda x: x[0])
+        years_list = [f"{year}: {count}" for year, count in years_sorted]
+        years_text = f"📅 Years: {', '.join(years_list)}\n"
+    
+    return f"""
 ✅ Found {stats['total']} memories!
 
 📊 Breakdown:
@@ -593,16 +588,16 @@ I can help you backup your Snapchat memories to Telegram!
 
 {years_text}
 🎯 Ready to start upload process?
-        """
+    """
 
-    async def send_final_summary(self, update: Update, user_session: UserSession):
-        """Send final summary after processing"""
-        elapsed = time.time() - user_session.start_time
-        total = len(user_session.memories)
-        success = user_session.success_count
-        failed = user_session.failed_count
-        
-        summary_text = f"""
+async def send_final_summary(update: Update, user_session: UserSession):
+    """Send final summary after processing"""
+    elapsed = time.time() - user_session.start_time
+    total = len(user_session.memories)
+    success = user_session.success_count
+    failed = user_session.failed_count
+    
+    summary_text = f"""
 🎉 *Backup Complete!*
 
 📊 Final Statistics:
@@ -618,87 +613,84 @@ I can help you backup your Snapchat memories to Telegram!
 
 """
 
-        if user_session.failed_memories:
-            summary_text += f"\n❌ Failed to upload {len(user_session.failed_memories)} memories."
-            if len(user_session.failed_memories) <= 10:
-                failed_list = "\n".join([f"• {m['date']} ({m['media_type']})" for m in user_session.failed_memories[:10]])
-                summary_text += f"\n\nFailed items:\n{failed_list}"
-        
-        summary_text += "\n\n💡 All successful memories are now safely stored in this chat!"
-        
-        await update.message.reply_text(summary_text, parse_mode='Markdown')
-
-    async def setup_webhook(self):
-        """Set up webhook for production"""
-        if self.webhook_url:
-            await self.application.bot.set_webhook(
-                url=f"{self.webhook_url}/webhook",
-                allowed_updates=Update.ALL_TYPES
-            )
-            logger.info(f"Webhook set to: {self.webhook_url}/webhook")
-
-    def run_webhook(self, host: str = "0.0.0.0", port: int = 5000):
-        """Run the bot with webhook (for production)"""
-        print("🤖 Starting Snapchat Memories Bot with Webhook...")
-        
-        # Create Flask app
-        app = Flask(__name__)
-        
-        @app.route('/')
-        def index():
-            return "🤖 Snapchat Memories Bot is running!"
-        
-        @app.route('/webhook', methods=['POST'])
-        def webhook():
-            """Webhook endpoint for Telegram"""
-            update = Update.de_json(request.get_json(), self.application.bot)
-            asyncio.run(self.application.process_update(update))
-            return 'OK'
-        
-        @app.route('/health')
-        def health():
-            return 'OK'
-        
-        # Run the Flask app
-        app.run(host=host, port=port)
-
-    def run_polling(self):
-        """Run the bot with polling (for development)"""
-        print("🤖 Starting Snapchat Memories Bot with Polling...")
-        try:
-            self.application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-                close_loop=False
-            )
-        except Exception as e:
-            print(f"Bot failed to start: {e}")
-            time.sleep(10)
-            self.run_polling()
-
-# Main execution
-if __name__ == '__main__':
-    BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    RENDER_ENV = os.getenv('RENDER', 'false').lower()
+    if user_session.failed_memories:
+        summary_text += f"\n❌ Failed to upload {len(user_session.failed_memories)} memories."
+        if len(user_session.failed_memories) <= 10:
+            failed_list = "\n".join([f"• {m['date']} ({m['media_type']})" for m in user_session.failed_memories[:10]])
+            summary_text += f"\n\nFailed items:\n{failed_list}"
     
-    if not BOT_TOKEN:
-        print("❌ Error: Please set TELEGRAM_BOT_TOKEN environment variable")
-        print("Get your token from @BotFather on Telegram")
-        exit(1)
+    summary_text += "\n\n💡 All successful memories are now safely stored in this chat!"
     
-    bot = SnapchatBot(BOT_TOKEN)
-    
-    # Check if we're in production (Render) or development
-    if RENDER_ENV == 'true' or os.getenv('RENDER_EXTERNAL_URL'):
-        # Production: Use webhook
+    await update.message.reply_text(summary_text, parse_mode='Markdown')
+
+# Add handlers to application
+application.add_handler(CommandHandler("start", start_command))
+application.add_handler(CommandHandler("help", help_command))
+application.add_handler(CommandHandler("stop", stop_command))
+application.add_handler(CommandHandler("status", status_command))
+application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# Flask routes
+@app.route('/')
+def index():
+    return "🤖 Snapchat Memories Bot is running! Send /start to your bot on Telegram."
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Webhook endpoint for Telegram"""
+    json_str = request.get_data().decode('UTF-8')
+    update = Update.de_json(json.loads(json_str), application.bot)
+    application.update_queue.put(update)
+    return 'OK'
+
+@app.route('/health')
+def health():
+    return 'OK'
+
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    """Manually set webhook URL"""
+    webhook_url = os.getenv('RENDER_EXTERNAL_URL')
+    if webhook_url:
+        # Run the async function in a new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(application.bot.set_webhook(
+            url=f"{webhook_url}/webhook",
+            allowed_updates=Update.ALL_TYPES
+        ))
+        loop.close()
+        return f"Webhook set to: {webhook_url}/webhook - Success: {result}"
+    return "RENDER_EXTERNAL_URL not set"
+
+# Initialize the bot when the app starts
+@app.before_first_request
+def initialize_bot():
+    """Initialize the bot when the app starts"""
+    try:
         webhook_url = os.getenv('RENDER_EXTERNAL_URL')
-        if not webhook_url:
-            print("❌ RENDER_EXTERNAL_URL environment variable not set")
-            exit(1)
-        
-        bot.webhook_url = webhook_url
-        asyncio.run(bot.setup_webhook())
-        bot.run_webhook()
-    else:
-        # Development: Use polling
-        bot.run_polling()
+        if webhook_url:
+            # Set webhook for production
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(application.bot.set_webhook(
+                url=f"{webhook_url}/webhook",
+                allowed_updates=Update.ALL_TYPES
+            ))
+            loop.close()
+            logger.info(f"Webhook set successfully: {result}")
+        else:
+            logger.info("Running in development mode (no webhook set)")
+    except Exception as e:
+        logger.error(f"Failed to initialize bot: {e}")
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    print(f"🤖 Starting Snapchat Memories Bot on port {port}...")
+    
+    # Initialize the bot
+    initialize_bot()
+    
+    # Run the Flask app
+    app.run(host='0.0.0.0', port=port, debug=False)
