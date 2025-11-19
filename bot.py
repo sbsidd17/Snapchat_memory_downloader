@@ -266,12 +266,11 @@ BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
 
-# Configure application with longer timeouts
+# Configure application with longer timeouts - FIXED: removed invalid attributes
 builder = Application.builder().token(BOT_TOKEN)
-builder.connect_timeout(60)
-builder.read_timeout(60)
-builder.write_timeout=60
-builder.pool_timeout=60
+builder = builder.connect_timeout(60)
+builder = builder.read_timeout(60)
+builder = builder.pool_timeout(60)
 
 application = builder.build()
 processor = SnapchatMemoryProcessor()
@@ -664,7 +663,7 @@ def set_webhook():
         return f"Webhook set to: {webhook_url}/webhook - Success: {result}"
     return "RENDER_EXTERNAL_URL not set"
 
-# Initialize the bot when the app starts (using app context instead of before_first_request)
+# Initialize the bot when the app starts
 def initialize_bot():
     """Initialize the bot when the app starts"""
     try:
