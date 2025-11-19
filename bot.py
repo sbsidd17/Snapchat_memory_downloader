@@ -14,6 +14,7 @@ import re
 from datetime import datetime
 from typing import Dict, List, Optional
 import time
+import random
 
 # Configure logging
 logging.basicConfig(
@@ -34,9 +35,12 @@ class UserSession:
         self.memories = []
         self.processed_count = 0
         self.success_count = 0
+        self.failed_count = 0
         self.start_time = None
         self.processing_message = None
         self.stats = {'images': 0, 'videos': 0, 'other': 0}
+        self.failed_memories = []
+        self.current_index = 0
 
     def reset(self):
         self.is_processing = False
@@ -44,8 +48,11 @@ class UserSession:
         self.current_file = None
         self.processed_count = 0
         self.success_count = 0
+        self.failed_count = 0
         self.start_time = None
         self.stats = {'images': 0, 'videos': 0, 'other': 0}
+        self.failed_memories = []
+        self.current_index = 0
 
 class SnapchatMemoryProcessor:
     def __init__(self):
@@ -89,7 +96,8 @@ class SnapchatMemoryProcessor:
                                     'location': location,
                                     'download_url': download_url,
                                     'is_get_request': 'true' in onclick_js.lower(),
-                                    'year': self.extract_year(date)
+                                    'year': self.extract_year(date),
+                                    'index': len(memories) + 1
                                 }
                                 memories.append(memory)
             except Exception as e:
@@ -141,20 +149,11 @@ class SnapchatMemoryProcessor:
         
         return stats
 
-    async def download_memory(self, session: aiohttp.ClientSession, memory: Dict, temp_dir: str, user_session: UserSession) -> Optional[Dict]:
+    async def download_memory(self, session: aiohttp.ClientSession, memory: Dict, temp_dir: str) -> Optional[Dict]:
         """Download a single memory file with retry logic"""
-        if user_session.should_stop:
-            return None
-            
         for attempt in range(3):
             try:
-                if user_session.should_stop:
-                    return None
-                    
                 url = memory['download_url']
-                
-                # Update current file in session
-                user_session.current_file = f"{memory['date']} ({memory['media_type']})"
                 
                 # Create filename based on date and media type
                 safe_date = memory['date'].replace(':', '-').replace(' ', '_').replace(' UTC', '')
@@ -198,16 +197,10 @@ class SnapchatMemoryProcessor:
         
         return None
 
-    async def upload_to_telegram(self, memory: Dict, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession) -> bool:
+    async def upload_to_telegram(self, memory: Dict, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         """Upload a single memory to Telegram with retry logic"""
-        if user_session.should_stop:
-            return False
-            
         for attempt in range(3):
             try:
-                if user_session.should_stop:
-                    return False
-                    
                 caption = self.create_caption(memory)
                 
                 if 'video' in memory['media_type']:
@@ -243,7 +236,6 @@ class SnapchatMemoryProcessor:
                 if attempt < 2:
                     await asyncio.sleep(3)
                     continue
-                await update.message.reply_text(f"❌ Failed to upload {memory['date']}")
                 return False
         
         return False
@@ -364,12 +356,15 @@ I can help you backup your Snapchat memories to Telegram!
         progress = user_session.processed_count
         total = len(user_session.memories)
         success = user_session.success_count
+        failed = user_session.failed_count
+        percentage = (progress / total) * 100 if total > 0 else 0
         
         status_text = f"""
 📊 *Current Status*
 
-✅ Processed: {progress}/{total}
-🎉 Successful: {success}
+🔢 Progress: {progress}/{total} ({percentage:.1f}%)
+✅ Successful: {success}
+❌ Failed: {failed}
 ⏰ Elapsed: {int(elapsed)}s
 📁 Current: {user_session.current_file or 'None'}
 
@@ -418,17 +413,25 @@ I can help you backup your Snapchat memories to Telegram!
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages."""
+        user_session = self.get_user_session(update.effective_user.id)
+        
+        # Check if this is a confirmation for large files
+        if user_session.memories and len(user_session.memories) > 100:
+            if update.message.text.lower() in ['yes', 'y', 'continue']:
+                await self.start_upload_process(update, context, user_session)
+                return
+            elif update.message.text.lower() in ['no', 'n', 'stop', 'cancel']:
+                await update.message.reply_text("❌ Process cancelled.")
+                user_session.reset()
+                return
+        
         await update.message.reply_text(
             "Please send me the HTML file you received from Snapchat data export.\n"
             "Use /help for instructions on how to get your data."
         )
 
     async def process_snapchat_file(self, html_content: str, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession):
-        """Process the Snapchat HTML file and upload memories."""
-        user_session.is_processing = True
-        user_session.should_stop = False
-        user_session.start_time = time.time()
-        
+        """Process the Snapchat HTML file and show statistics"""
         try:
             # Step 1: Parse HTML
             parsing_msg = await update.message.reply_text("🔍 Analyzing your Snapchat data file...")
@@ -437,7 +440,6 @@ I can help you backup your Snapchat memories to Telegram!
             
             if not user_session.memories:
                 await parsing_msg.edit_text("❌ No memories found in the HTML file. Please make sure it's a valid Snapchat data export.")
-                user_session.reset()
                 return
             
             # Step 2: Show statistics
@@ -450,27 +452,23 @@ I can help you backup your Snapchat memories to Telegram!
             if stats['total'] > 100:
                 confirm_msg = await update.message.reply_text(
                     f"⚠️ Found {stats['total']} memories. This may take a while.\n"
-                    "Reply 'yes' to continue or /stop to cancel."
+                    "Reply 'yes' to continue or 'no' to cancel."
                 )
-                
-                # Wait for confirmation
-                try:
-                    confirmation = await context.bot.wait_for(
-                        'message',
-                        timeout=30.0,
-                        filters=filters.TEXT & filters.User(update.effective_user.id)
-                    )
-                    
-                    if confirmation.text.lower() not in ['yes', 'y', 'continue']:
-                        await update.message.reply_text("❌ Process cancelled.")
-                        user_session.reset()
-                        return
-                        
-                except asyncio.TimeoutError:
-                    await update.message.reply_text("❌ Confirmation timeout. Process cancelled.")
-                    user_session.reset()
-                    return
+            else:
+                # Start immediately for small files
+                await self.start_upload_process(update, context, user_session)
             
+        except Exception as e:
+            logger.error(f"Error in process_snapchat_file: {e}")
+            await update.message.reply_text(f"❌ Unexpected error: {str(e)}")
+
+    async def start_upload_process(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession):
+        """Start the upload process"""
+        user_session.is_processing = True
+        user_session.should_stop = False
+        user_session.start_time = time.time()
+        
+        try:
             # Step 3: Start processing
             progress_msg = await update.message.reply_text(
                 "⏳ Starting upload process...\n\n"
@@ -482,41 +480,44 @@ I can help you backup your Snapchat memories to Telegram!
             
             # Create temporary directory for downloads
             with tempfile.TemporaryDirectory() as temp_dir:
-                # Process memories in batches to avoid memory issues
-                await self.process_memories_batch(update, context, user_session, temp_dir)
+                # Process memories one by one
+                await self.process_memories_sequential(update, context, user_session, temp_dir)
             
             # Final summary
             await self.send_final_summary(update, user_session)
             
         except Exception as e:
-            logger.error(f"Error in process_snapchat_file: {e}")
+            logger.error(f"Error in start_upload_process: {e}")
             await update.message.reply_text(f"❌ Unexpected error: {str(e)}")
         finally:
             user_session.reset()
 
-    async def process_memories_batch(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession, temp_dir: str):
-        """Process memories in batches"""
-        connector = aiohttp.TCPConnector(limit=5)
+    async def process_memories_sequential(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession, temp_dir: str):
+        """Process memories one by one with proper tracking"""
+        total_memories = len(user_session.memories)
         
-        async with aiohttp.ClientSession(connector=connector) as session:
+        # Create a single HTTP session for all requests
+        async with aiohttp.ClientSession() as session:
             for i, memory in enumerate(user_session.memories):
                 if user_session.should_stop:
                     await update.message.reply_text("🛑 Process stopped by user.")
                     break
                 
-                # Update progress every 10 files or when percentage changes significantly
-                if i % 10 == 0 or i == len(user_session.memories) - 1:
-                    await self.update_progress_message(user_session, update)
+                user_session.current_index = i + 1
+                user_session.current_file = f"{memory['date']} ({memory['media_type']})"
+                
+                # Update progress
+                await self.update_progress_message(user_session, update)
                 
                 # Download memory
-                downloaded_memory = await self.processor.download_memory(session, memory, temp_dir, user_session)
-                user_session.processed_count += 1
+                downloaded_memory = await self.processor.download_memory(session, memory, temp_dir)
                 
-                if downloaded_memory and not user_session.should_stop:
+                if downloaded_memory:
                     # Upload to Telegram
-                    if await self.processor.upload_to_telegram(downloaded_memory, update, context, user_session):
+                    success = await self.processor.upload_to_telegram(downloaded_memory, update, context)
+                    
+                    if success:
                         user_session.success_count += 1
-                        
                         # Update stats
                         if 'image' in memory['media_type']:
                             user_session.stats['images'] += 1
@@ -524,9 +525,19 @@ I can help you backup your Snapchat memories to Telegram!
                             user_session.stats['videos'] += 1
                         else:
                             user_session.stats['other'] += 1
+                    else:
+                        user_session.failed_count += 1
+                        user_session.failed_memories.append(memory)
+                        logger.error(f"Failed to upload: {memory['date']}")
+                else:
+                    user_session.failed_count += 1
+                    user_session.failed_memories.append(memory)
+                    logger.error(f"Failed to download: {memory['date']}")
                 
-                # Small delay to avoid rate limits
-                await asyncio.sleep(1)
+                user_session.processed_count += 1
+                
+                # Small delay to avoid rate limits (random between 1-3 seconds)
+                await asyncio.sleep(random.uniform(1, 3))
                 
                 # Clean up downloaded file
                 if downloaded_memory and 'filepath' in downloaded_memory:
@@ -540,24 +551,27 @@ I can help you backup your Snapchat memories to Telegram!
         if not user_session.processing_message:
             return
             
-        progress = user_session.processed_count
+        current = user_session.current_index
         total = len(user_session.memories)
         success = user_session.success_count
-        percentage = (progress / total) * 100 if total > 0 else 0
+        failed = user_session.failed_count
+        percentage = (current / total) * 100 if total > 0 else 0
         
         progress_text = (
             f"📤 Uploading memories...\n\n"
-            f"✅ Processed: {progress}/{total} ({percentage:.1f}%)\n"
-            f"🎉 Successful: {success}\n"
-            f"📊 Images: {user_session.stats['images']} | Videos: {user_session.stats['videos']}\n\n"
+            f"🔢 Progress: {current}/{total} ({percentage:.1f}%)\n"
+            f"✅ Successful: {success}\n"
+            f"❌ Failed: {failed}\n"
+            f"📊 Images: {user_session.stats['images']} | Videos: {user_session.stats['videos']}\n"
+            f"📁 Current: {user_session.current_file}\n\n"
             f"🛑 Use /stop to cancel\n"
             f"📊 Use /status for details"
         )
         
         try:
             await user_session.processing_message.edit_text(progress_text)
-        except:
-            pass  # Message might be too old to edit
+        except Exception as e:
+            logger.warning(f"Could not update progress message: {e}")
 
     def format_statistics(self, stats: Dict) -> str:
         """Format statistics for display"""
@@ -584,7 +598,7 @@ I can help you backup your Snapchat memories to Telegram!
         elapsed = time.time() - user_session.start_time
         total = len(user_session.memories)
         success = user_session.success_count
-        failed = total - success
+        failed = user_session.failed_count
         
         summary_text = f"""
 🎉 *Backup Complete!*
@@ -600,8 +614,15 @@ I can help you backup your Snapchat memories to Telegram!
 • Videos: {user_session.stats['videos']}
 • Other: {user_session.stats['other']}
 
-💡 All your memories are now safely stored in this chat!
-        """
+"""
+
+        if user_session.failed_memories:
+            summary_text += f"\n❌ Failed to upload {len(user_session.failed_memories)} memories."
+            if len(user_session.failed_memories) <= 10:
+                failed_list = "\n".join([f"• {m['date']} ({m['media_type']})" for m in user_session.failed_memories[:10]])
+                summary_text += f"\n\nFailed items:\n{failed_list}"
+        
+        summary_text += "\n\n💡 All successful memories are now safely stored in this chat!"
         
         await update.message.reply_text(summary_text, parse_mode='Markdown')
 
