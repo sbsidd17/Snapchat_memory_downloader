@@ -270,8 +270,8 @@ if not BOT_TOKEN:
 builder = Application.builder().token(BOT_TOKEN)
 builder.connect_timeout(60)
 builder.read_timeout(60)
-builder.write_timeout(60)
-builder.pool_timeout(60)
+builder.write_timeout=60
+builder.pool_timeout=60
 
 application = builder.build()
 processor = SnapchatMemoryProcessor()
@@ -664,8 +664,7 @@ def set_webhook():
         return f"Webhook set to: {webhook_url}/webhook - Success: {result}"
     return "RENDER_EXTERNAL_URL not set"
 
-# Initialize the bot when the app starts
-@app.before_first_request
+# Initialize the bot when the app starts (using app context instead of before_first_request)
 def initialize_bot():
     """Initialize the bot when the app starts"""
     try:
@@ -685,12 +684,12 @@ def initialize_bot():
     except Exception as e:
         logger.error(f"Failed to initialize bot: {e}")
 
+# Initialize the bot immediately when the module is imported
+initialize_bot()
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"🤖 Starting Snapchat Memories Bot on port {port}...")
-    
-    # Initialize the bot
-    initialize_bot()
     
     # Run the Flask app
     app.run(host='0.0.0.0', port=port, debug=False)
