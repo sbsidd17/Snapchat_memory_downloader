@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import TimedOut, NetworkError
 import aiohttp
 from bs4 import BeautifulSoup
@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 import time
 import random
+from flask import Flask, request
 
 # Configure logging
 logging.basicConfig(
@@ -258,8 +259,9 @@ class SnapchatMemoryProcessor:
         return '\n'.join(caption_parts)
 
 class SnapchatBot:
-    def __init__(self, token: str):
+    def __init__(self, token: str, webhook_url: str = None):
         self.token = token
+        self.webhook_url = webhook_url
         
         # Configure application with longer timeouts
         builder = Application.builder().token(token)
@@ -626,9 +628,43 @@ I can help you backup your Snapchat memories to Telegram!
         
         await update.message.reply_text(summary_text, parse_mode='Markdown')
 
-    def run(self):
-        """Start the bot"""
-        print("🤖 Snapchat Memories Bot is starting...")
+    async def setup_webhook(self):
+        """Set up webhook for production"""
+        if self.webhook_url:
+            await self.application.bot.set_webhook(
+                url=f"{self.webhook_url}/webhook",
+                allowed_updates=Update.ALL_TYPES
+            )
+            logger.info(f"Webhook set to: {self.webhook_url}/webhook")
+
+    def run_webhook(self, host: str = "0.0.0.0", port: int = 5000):
+        """Run the bot with webhook (for production)"""
+        print("🤖 Starting Snapchat Memories Bot with Webhook...")
+        
+        # Create Flask app
+        app = Flask(__name__)
+        
+        @app.route('/')
+        def index():
+            return "🤖 Snapchat Memories Bot is running!"
+        
+        @app.route('/webhook', methods=['POST'])
+        def webhook():
+            """Webhook endpoint for Telegram"""
+            update = Update.de_json(request.get_json(), self.application.bot)
+            asyncio.run(self.application.process_update(update))
+            return 'OK'
+        
+        @app.route('/health')
+        def health():
+            return 'OK'
+        
+        # Run the Flask app
+        app.run(host=host, port=port)
+
+    def run_polling(self):
+        """Run the bot with polling (for development)"""
+        print("🤖 Starting Snapchat Memories Bot with Polling...")
         try:
             self.application.run_polling(
                 allowed_updates=Update.ALL_TYPES,
@@ -637,13 +673,13 @@ I can help you backup your Snapchat memories to Telegram!
             )
         except Exception as e:
             print(f"Bot failed to start: {e}")
-            # Retry after delay
             time.sleep(10)
-            self.run()
+            self.run_polling()
 
 # Main execution
 if __name__ == '__main__':
     BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    RENDER_ENV = os.getenv('RENDER', 'false').lower()
     
     if not BOT_TOKEN:
         print("❌ Error: Please set TELEGRAM_BOT_TOKEN environment variable")
@@ -651,4 +687,18 @@ if __name__ == '__main__':
         exit(1)
     
     bot = SnapchatBot(BOT_TOKEN)
-    bot.run()
+    
+    # Check if we're in production (Render) or development
+    if RENDER_ENV == 'true' or os.getenv('RENDER_EXTERNAL_URL'):
+        # Production: Use webhook
+        webhook_url = os.getenv('RENDER_EXTERNAL_URL')
+        if not webhook_url:
+            print("❌ RENDER_EXTERNAL_URL environment variable not set")
+            exit(1)
+        
+        bot.webhook_url = webhook_url
+        asyncio.run(bot.setup_webhook())
+        bot.run_webhook()
+    else:
+        # Development: Use polling
+        bot.run_polling()
