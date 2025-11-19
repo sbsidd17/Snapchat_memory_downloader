@@ -1,10 +1,4 @@
-from bot import SnapchatBot
-import os
-
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-bot = SnapchatBot(BOT_TOKEN)
-
-app = bot.application
+from bot import app
 
 if __name__ == '__main__':
-    bot.run_webhook()
+    app.run(host='0.0.0.0', port=5000, debug=False)
