@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 import re
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -19,6 +20,11 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Configuration
+REQUEST_TIMEOUT = 60  # Increase timeout to 60 seconds
+MAX_RETRIES = 3
+RETRY_DELAY = 5
 
 class SnapchatMemoryProcessor:
     def __init__(self):
@@ -60,68 +66,108 @@ class SnapchatMemoryProcessor:
         return memories
 
     async def download_memory(self, session, memory, temp_dir):
-        """Download a single memory file"""
-        try:
-            url = memory['download_url']
-            
-            # Create filename based on date and media type
-            safe_date = memory['date'].replace(':', '-').replace(' ', '_')
-            extension = '.mp4' if memory['media_type'].lower() == 'video' else '.jpg'
-            filename = f"{safe_date}_{memory['media_type']}{extension}"
-            filepath = os.path.join(temp_dir, filename)
-            
-            headers = {}
-            if memory['is_get_request']:
-                headers['X-Snap-Route-Tag'] = 'mem-dmd'
-            
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    
-                    with open(filepath, 'wb') as f:
-                        f.write(content)
-                    
-                    memory['filepath'] = filepath
-                    memory['filesize'] = len(content)
-                    return memory
-                else:
-                    logger.error(f"Failed to download {url}: Status {response.status}")
-                    return None
-                    
-        except Exception as e:
-            logger.error(f"Error downloading memory: {e}")
-            return None
+        """Download a single memory file with retry logic"""
+        for attempt in range(MAX_RETRIES):
+            try:
+                url = memory['download_url']
+                
+                # Create filename based on date and media type
+                safe_date = memory['date'].replace(':', '-').replace(' ', '_')
+                extension = '.mp4' if memory['media_type'].lower() == 'video' else '.jpg'
+                filename = f"{safe_date}_{memory['media_type']}{extension}"
+                filepath = os.path.join(temp_dir, filename)
+                
+                headers = {}
+                if memory['is_get_request']:
+                    headers['X-Snap-Route-Tag'] = 'mem-dmd'
+                
+                timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+                async with session.get(url, headers=headers, timeout=timeout) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        
+                        with open(filepath, 'wb') as f:
+                            f.write(content)
+                        
+                        memory['filepath'] = filepath
+                        memory['filesize'] = len(content)
+                        return memory
+                    else:
+                        logger.error(f"Attempt {attempt + 1} failed to download {url}: Status {response.status}")
+                        if attempt < MAX_RETRIES - 1:
+                            await asyncio.sleep(RETRY_DELAY)
+                            continue
+                        return None
+                        
+            except asyncio.TimeoutError:
+                logger.error(f"Attempt {attempt + 1} timeout downloading {memory['date']}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY)
+                    continue
+                return None
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} error downloading memory: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY)
+                    continue
+                return None
 
     async def upload_to_telegram(self, memory, update, context):
-        """Upload a single memory to Telegram"""
-        try:
-            caption = f"📅 {memory['date']}\n📹 {memory['media_type']}\n📍 {memory['location']}"
-            
-            if memory['media_type'].lower() == 'video':
-                with open(memory['filepath'], 'rb') as video_file:
-                    await update.message.reply_video(
-                        video=video_file,
-                        caption=caption,
-                        supports_streaming=True
-                    )
-            else:
-                with open(memory['filepath'], 'rb') as photo_file:
-                    await update.message.reply_photo(
-                        photo=photo_file,
-                        caption=caption
-                    )
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error uploading to Telegram: {e}")
-            await update.message.reply_text(f"❌ Failed to upload {memory['date']}: {str(e)}")
-            return False
+        """Upload a single memory to Telegram with retry logic"""
+        for attempt in range(MAX_RETRIES):
+            try:
+                caption = f"📅 {memory['date']}\n📹 {memory['media_type']}\n📍 {memory['location']}"
+                
+                if memory['media_type'].lower() == 'video':
+                    with open(memory['filepath'], 'rb') as video_file:
+                        await update.message.reply_video(
+                            video=video_file,
+                            caption=caption,
+                            supports_streaming=True,
+                            read_timeout=REQUEST_TIMEOUT,
+                            write_timeout=REQUEST_TIMEOUT,
+                            connect_timeout=REQUEST_TIMEOUT
+                        )
+                else:
+                    with open(memory['filepath'], 'rb') as photo_file:
+                        await update.message.reply_photo(
+                            photo=photo_file,
+                            caption=caption,
+                            read_timeout=REQUEST_TIMEOUT,
+                            write_timeout=REQUEST_TIMEOUT,
+                            connect_timeout=REQUEST_TIMEOUT
+                        )
+                
+                return True
+                
+            except asyncio.TimeoutError:
+                logger.error(f"Attempt {attempt + 1} timeout uploading {memory['date']}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY)
+                    continue
+                return False
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} error uploading to Telegram: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY)
+                    continue
+                await update.message.reply_text(f"❌ Failed to upload {memory['date']}: {str(e)}")
+                return False
 
 class SnapchatBot:
     def __init__(self, token):
         self.token = token
-        self.application = Application.builder().token(token).build()
+        
+        # Configure application with longer timeouts
+        builder = Application.builder().token(token)
+        
+        # Set timeouts for the bot
+        builder.connect_timeout(REQUEST_TIMEOUT)
+        builder.read_timeout(REQUEST_TIMEOUT)
+        builder.write_timeout(REQUEST_TIMEOUT)
+        builder.pool_timeout(REQUEST_TIMEOUT)
+        
+        self.application = builder.build()
         self.processor = SnapchatMemoryProcessor()
         
         # Add handlers
@@ -185,17 +231,25 @@ Use /help for more information.
         file = await context.bot.get_file(document.file_id)
         
         with tempfile.NamedTemporaryFile(mode='w+b', suffix='.html', delete=False) as temp_file:
-            await file.download_to_drive(temp_file.name)
+            temp_path = temp_file.name
+            
+        try:
+            await file.download_to_drive(temp_path)
             
             # Read and process the HTML file
-            with open(temp_file.name, 'r', encoding='utf-8') as f:
+            with open(temp_path, 'r', encoding='utf-8') as f:
                 html_content = f.read()
             
+            # Process the HTML file
+            await self.process_snapchat_file(html_content, update, context)
+            
+        except Exception as e:
+            logger.error(f"Error handling document: {e}")
+            await update.message.reply_text(f"❌ Error processing file: {str(e)}")
+        finally:
             # Clean up temp file
-            os.unlink(temp_file.name)
-
-        # Process the HTML file
-        await self.process_snapchat_file(html_content, update, context)
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages."""
@@ -222,7 +276,10 @@ Use /help for more information.
             with tempfile.TemporaryDirectory() as temp_dir:
                 # Download all memories
                 downloaded_memories = []
-                async with aiohttp.ClientSession() as session:
+                connector = aiohttp.TCPConnector(limit=10)  # Limit concurrent connections
+                timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+                
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                     tasks = []
                     for memory in memories:
                         task = self.processor.download_memory(session, memory, temp_dir)
@@ -246,7 +303,7 @@ Use /help for more information.
                         await status_msg.delete()
                         
                         # Small delay to avoid rate limits
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(2)
                         
                     except Exception as e:
                         logger.error(f"Error in upload process: {e}")
@@ -269,9 +326,28 @@ Use /help for more information.
             await processing_msg.edit_text(f"❌ Error processing file: {str(e)}")
 
     def run(self):
-        """Start the bot."""
-        print("Bot is running...")
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        """Start the bot with retry logic."""
+        print("Starting bot with improved timeout configuration...")
+        
+        # Add retry logic for connection issues
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"Attempt {attempt + 1} to start bot...")
+                self.application.run_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,
+                    close_loop=False
+                )
+                break
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying in 10 seconds...")
+                    time.sleep(10)
+                else:
+                    print("All retry attempts failed. Exiting.")
+                    raise
 
 # Main execution
 if __name__ == '__main__':
