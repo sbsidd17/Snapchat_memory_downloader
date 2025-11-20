@@ -264,16 +264,28 @@ app = Flask(__name__)
 # Initialize bot application
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+    print("❌ ERROR: TELEGRAM_BOT_TOKEN environment variable is required")
+    # Don't raise error, just log and continue for now
 
-# Configure application with longer timeouts - FIXED: removed invalid attributes
-builder = Application.builder().token(BOT_TOKEN)
-builder = builder.connect_timeout(60)
-builder = builder.read_timeout(60)
-builder = builder.pool_timeout(60)
+# Configure application with longer timeouts
+try:
+    if BOT_TOKEN:
+        builder = Application.builder().token(BOT_TOKEN)
+        builder = builder.connect_timeout(60)
+        builder = builder.read_timeout(60)
+        builder = builder.pool_timeout(60)
 
-application = builder.build()
-processor = SnapchatMemoryProcessor()
+        application = builder.build()
+        processor = SnapchatMemoryProcessor()
+        print("✅ Bot application initialized successfully")
+    else:
+        application = None
+        processor = SnapchatMemoryProcessor()
+        print("⚠️ Bot application not initialized - missing token")
+except Exception as e:
+    print(f"❌ Error initializing bot: {e}")
+    application = None
+    processor = SnapchatMemoryProcessor()
 
 def get_user_session(user_id: int) -> UserSession:
     """Get or create user session"""
@@ -622,13 +634,14 @@ async def send_final_summary(update: Update, user_session: UserSession):
     
     await update.message.reply_text(summary_text, parse_mode='Markdown')
 
-# Add handlers to application
-application.add_handler(CommandHandler("start", start_command))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CommandHandler("stop", stop_command))
-application.add_handler(CommandHandler("status", status_command))
-application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+# Add handlers to application only if it exists
+if application:
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 # Flask routes
 @app.route('/')
@@ -638,10 +651,17 @@ def index():
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Webhook endpoint for Telegram"""
-    json_str = request.get_data().decode('UTF-8')
-    update = Update.de_json(json.loads(json_str), application.bot)
-    application.update_queue.put(update)
-    return 'OK'
+    try:
+        if not application:
+            return "Bot not initialized", 500
+            
+        json_str = request.get_data().decode('UTF-8')
+        update = Update.de_json(json.loads(json_str), application.bot)
+        application.update_queue.put(update)
+        return 'OK'
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return f"Error processing webhook: {str(e)}", 500
 
 @app.route('/health')
 def health():
@@ -650,40 +670,124 @@ def health():
 @app.route('/set_webhook', methods=['GET'])
 def set_webhook():
     """Manually set webhook URL"""
-    webhook_url = os.getenv('RENDER_EXTERNAL_URL')
-    if webhook_url:
+    try:
+        if not application:
+            return "Bot not initialized - check TELEGRAM_BOT_TOKEN", 500
+            
+        webhook_url = os.getenv('RENDER_EXTERNAL_URL')
+        if not webhook_url:
+            return "RENDER_EXTERNAL_URL environment variable not set", 500
+        
         # Run the async function in a new event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        
+        # First, delete any existing webhook
+        loop.run_until_complete(application.bot.delete_webhook())
+        
+        # Set new webhook
         result = loop.run_until_complete(application.bot.set_webhook(
             url=f"{webhook_url}/webhook",
-            allowed_updates=Update.ALL_TYPES
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
         ))
+        
         loop.close()
-        return f"Webhook set to: {webhook_url}/webhook - Success: {result}"
-    return "RENDER_EXTERNAL_URL not set"
+        
+        # Check if webhook was set successfully
+        if result:
+            return f"✅ Webhook set successfully to: {webhook_url}/webhook"
+        else:
+            return "❌ Failed to set webhook", 500
+            
+    except Exception as e:
+        logger.error(f"Error setting webhook: {e}")
+        return f"Error setting webhook: {str(e)}", 500
+
+@app.route('/delete_webhook', methods=['GET'])
+def delete_webhook():
+    """Delete webhook URL"""
+    try:
+        if not application:
+            return "Bot not initialized", 500
+            
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(application.bot.delete_webhook())
+        loop.close()
+        
+        if result:
+            return "✅ Webhook deleted successfully"
+        else:
+            return "❌ Failed to delete webhook", 500
+            
+    except Exception as e:
+        logger.error(f"Error deleting webhook: {e}")
+        return f"Error deleting webhook: {str(e)}", 500
+
+@app.route('/webhook_info', methods=['GET'])
+def webhook_info():
+    """Get webhook info"""
+    try:
+        if not application:
+            return "Bot not initialized", 500
+            
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        webhook_info = loop.run_until_complete(application.bot.get_webhook_info())
+        loop.close()
+        
+        return {
+            "url": webhook_info.url,
+            "has_custom_certificate": webhook_info.has_custom_certificate,
+            "pending_update_count": webhook_info.pending_update_count,
+            "last_error_date": webhook_info.last_error_date,
+            "last_error_message": webhook_info.last_error_message,
+            "max_connections": webhook_info.max_connections,
+            "allowed_updates": webhook_info.allowed_updates
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting webhook info: {e}")
+        return f"Error getting webhook info: {str(e)}", 500
 
 # Initialize the bot when the app starts
 def initialize_bot():
     """Initialize the bot when the app starts"""
     try:
+        if not BOT_TOKEN:
+            print("⚠️ Skipping bot initialization - no TELEGRAM_BOT_TOKEN")
+            return
+            
         webhook_url = os.getenv('RENDER_EXTERNAL_URL')
         if webhook_url:
+            print(f"🚀 Setting up webhook for: {webhook_url}")
             # Set webhook for production
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            
+            # Delete any existing webhook first
+            loop.run_until_complete(application.bot.delete_webhook())
+            
+            # Set new webhook
             result = loop.run_until_complete(application.bot.set_webhook(
                 url=f"{webhook_url}/webhook",
-                allowed_updates=Update.ALL_TYPES
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
             ))
             loop.close()
-            logger.info(f"Webhook set successfully: {result}")
+            
+            if result:
+                print(f"✅ Webhook set successfully: {webhook_url}/webhook")
+            else:
+                print("❌ Failed to set webhook")
         else:
-            logger.info("Running in development mode (no webhook set)")
+            print("ℹ️ Running in development mode (no webhook set)")
     except Exception as e:
-        logger.error(f"Failed to initialize bot: {e}")
+        print(f"❌ Failed to initialize bot: {e}")
 
 # Initialize the bot immediately when the module is imported
+print("🤖 Initializing Snapchat Memories Bot...")
 initialize_bot()
 
 if __name__ == '__main__':
