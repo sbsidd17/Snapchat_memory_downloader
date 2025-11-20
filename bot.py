@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 import time
 import random
 from flask import Flask, request
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -60,18 +61,15 @@ class SnapchatMemoryProcessor:
         self.timeout = aiohttp.ClientTimeout(total=60)
         
     def parse_html_file(self, html_content: str) -> List[Dict]:
-        """Parse Snapchat HTML file and extract memory download links with better parsing"""
+        """Parse Snapchat HTML file and extract memory download links"""
         soup = BeautifulSoup(html_content, 'html.parser')
         memories = []
         
-        # Find the memories table
         table = soup.find('table')
         if not table:
-            logger.error("No table found in HTML")
             return memories
             
-        # Find all table rows (skip header row)
-        rows = table.find_all('tr')[1:]  # Skip header row
+        rows = table.find_all('tr')[1:]
         
         for row in rows:
             try:
@@ -81,12 +79,10 @@ class SnapchatMemoryProcessor:
                     media_type = cols[1].get_text(strip=True).lower()
                     location = cols[2].get_text(strip=True)
                     
-                    # Find download link in the last column
                     download_span = cols[3].find('span', class_='require-js-enabled')
                     if download_span:
                         download_link = download_span.find('a', onclick=True)
                         if download_link:
-                            # Extract URL from onclick attribute
                             onclick_js = download_link.get('onclick', '')
                             url_match = re.search(r"downloadMemories\('([^']+)'", onclick_js)
                             if url_match:
@@ -102,7 +98,6 @@ class SnapchatMemoryProcessor:
                                 }
                                 memories.append(memory)
             except Exception as e:
-                logger.error(f"Error parsing row: {e}")
                 continue
         
         return memories
@@ -110,7 +105,6 @@ class SnapchatMemoryProcessor:
     def extract_year(self, date_str: str) -> int:
         """Extract year from date string"""
         try:
-            # Handle different date formats
             if 'UTC' in date_str:
                 date_str = date_str.replace(' UTC', '')
             dt = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
@@ -126,14 +120,12 @@ class SnapchatMemoryProcessor:
             'videos': 0,
             'other': 0,
             'years': {},
-            'by_type': {}
         }
         
         for memory in memories:
             media_type = memory['media_type']
             year = memory['year']
             
-            # Count by media type
             if 'image' in media_type:
                 stats['images'] += 1
             elif 'video' in media_type:
@@ -141,22 +133,17 @@ class SnapchatMemoryProcessor:
             else:
                 stats['other'] += 1
             
-            # Count by year
             if year > 0:
                 stats['years'][year] = stats['years'].get(year, 0) + 1
-            
-            # Count by specific type
-            stats['by_type'][media_type] = stats['by_type'].get(media_type, 0) + 1
         
         return stats
 
     async def download_memory(self, session: aiohttp.ClientSession, memory: Dict, temp_dir: str) -> Optional[Dict]:
-        """Download a single memory file with retry logic"""
+        """Download a single memory file"""
         for attempt in range(3):
             try:
                 url = memory['download_url']
                 
-                # Create filename based on date and media type
                 safe_date = memory['date'].replace(':', '-').replace(' ', '_').replace(' UTC', '')
                 extension = '.mp4' if 'video' in memory['media_type'] else '.jpg'
                 filename = f"{safe_date}_{memory['media_type']}{extension}"
@@ -169,135 +156,62 @@ class SnapchatMemoryProcessor:
                 async with session.get(url, headers=headers, timeout=self.timeout) as response:
                     if response.status == 200:
                         content = await response.read()
-                        
                         with open(filepath, 'wb') as f:
                             f.write(content)
-                        
                         memory['filepath'] = filepath
-                        memory['filesize'] = len(content)
                         return memory
-                    else:
-                        logger.warning(f"Attempt {attempt + 1} failed for {memory['date']}: Status {response.status}")
-                        if attempt < 2:
-                            await asyncio.sleep(2)
-                            continue
-                        return None
-                        
-            except asyncio.TimeoutError:
-                logger.warning(f"Attempt {attempt + 1} timeout for {memory['date']}")
-                if attempt < 2:
-                    await asyncio.sleep(2)
-                    continue
-                return None
             except Exception as e:
-                logger.warning(f"Attempt {attempt + 1} error for {memory['date']}: {e}")
                 if attempt < 2:
                     await asyncio.sleep(2)
                     continue
-                return None
-        
         return None
 
     async def upload_to_telegram(self, memory: Dict, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        """Upload a single memory to Telegram with retry logic"""
+        """Upload a single memory to Telegram"""
         for attempt in range(3):
             try:
-                caption = self.create_caption(memory)
+                caption = f"📅 {memory['date']}\n📹 {memory['media_type'].title()}"
+                
+                location = memory['location']
+                if location and '0.0, 0.0' not in location:
+                    if 'Latitude, Longitude:' in location:
+                        coords = location.replace('Latitude, Longitude:', '').strip()
+                        caption += f"\n📍 {coords}"
                 
                 if 'video' in memory['media_type']:
                     with open(memory['filepath'], 'rb') as video_file:
                         await update.message.reply_video(
                             video=video_file,
                             caption=caption,
-                            supports_streaming=True,
-                            read_timeout=60,
-                            write_timeout=60,
-                            connect_timeout=60
+                            supports_streaming=True
                         )
                 else:
                     with open(memory['filepath'], 'rb') as photo_file:
                         await update.message.reply_photo(
                             photo=photo_file,
-                            caption=caption,
-                            read_timeout=60,
-                            write_timeout=60,
-                            connect_timeout=60
+                            caption=caption
                         )
-                
                 return True
-                
-            except TimedOut:
-                logger.warning(f"Upload timeout for {memory['date']}, attempt {attempt + 1}")
-                if attempt < 2:
-                    await asyncio.sleep(3)
-                    continue
-                return False
             except Exception as e:
-                logger.warning(f"Upload error for {memory['date']}: {e}, attempt {attempt + 1}")
                 if attempt < 2:
                     await asyncio.sleep(3)
                     continue
-                return False
-        
         return False
 
-    def create_caption(self, memory: Dict) -> str:
-        """Create caption for Telegram message"""
-        caption_parts = [
-            f"📅 {memory['date']}",
-            f"📹 {memory['media_type'].title()}"
-        ]
-        
-        location = memory['location']
-        if location and '0.0, 0.0' not in location:
-            if 'Latitude, Longitude:' in location:
-                coords = location.replace('Latitude, Longitude:', '').strip()
-                caption_parts.append(f"📍 {coords}")
-            else:
-                caption_parts.append(f"📍 {location}")
-        
-        return '\n'.join(caption_parts)
-
-# Create Flask app first
+# Create Flask app
 app = Flask(__name__)
 
-# Initialize bot application
+# Initialize bot
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-if not BOT_TOKEN:
-    print("❌ ERROR: TELEGRAM_BOT_TOKEN environment variable is required")
-    # Don't raise error, just log and continue for now
+application = None
+processor = SnapchatMemoryProcessor()
 
-# Configure application with longer timeouts
-try:
-    if BOT_TOKEN:
-        builder = Application.builder().token(BOT_TOKEN)
-        builder = builder.connect_timeout(60)
-        builder = builder.read_timeout(60)
-        builder = builder.pool_timeout(60)
-
-        application = builder.build()
-        processor = SnapchatMemoryProcessor()
-        print("✅ Bot application initialized successfully")
-    else:
-        application = None
-        processor = SnapchatMemoryProcessor()
-        print("⚠️ Bot application not initialized - missing token")
-except Exception as e:
-    print(f"❌ Error initializing bot: {e}")
-    application = None
-    processor = SnapchatMemoryProcessor()
-
-async def check_bot_connection():
-    """Check if bot can connect to Telegram API"""
+if BOT_TOKEN:
     try:
-        if not application or not application.bot:
-            return False, "Bot not initialized"
-        
-        # Test API connection by getting bot info
-        bot_info = await application.bot.get_me()
-        return True, f"✅ Bot connected as: @{bot_info.username} (ID: {bot_info.id})"
+        application = Application.builder().token(BOT_TOKEN).build()
+        print("✅ Bot application initialized")
     except Exception as e:
-        return False, f"❌ Bot connection failed: {str(e)}"
+        print(f"❌ Failed to initialize bot: {e}")
 
 def get_user_session(user_id: int) -> UserSession:
     """Get or create user session"""
@@ -306,108 +220,49 @@ def get_user_session(user_id: int) -> UserSession:
     return user_sessions[user_id]
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send welcome message when command /start is issued."""
-    welcome_text = """
-🤖 *Snapchat Memories Bot*
-
-I can help you backup your Snapchat memories to Telegram!
-
-*How to use:*
-1. Go to Snapchat app → Settings → My Data
-2. Request your data and download the HTML file
-3. Send that HTML file to me
-4. I'll extract all your memories and upload them here
-
-*Commands:*
-/start - Show this welcome message
-/help - Detailed instructions
-/stop - Stop current upload process
-/status - Check current progress
-
-⚠️ *Note:* Download links expire after 7 days, so use fresh data exports.
-    """
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    await update.message.reply_text(
+        "🤖 *Snapchat Memories Bot*\n\n"
+        "Send me your Snapchat data export HTML file and I'll upload all your memories here!",
+        parse_mode='Markdown'
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send help message when command /help is issued."""
-    help_text = """
-📖 *Help Guide*
-
-*Steps to get your Snapchat data:*
-1. Open Snapchat → Settings (gear icon)
-2. Scroll to "Privacy Controls" → "My Data"
-3. Tap "Submit Request" → Choose "Memories"
-4. Wait for email (usually takes few hours)
-5. Download the HTML file from the email
-6. Send that HTML file to this bot
-
-*Features:*
-✅ Parse Snapchat data export HTML
-✅ Download all memories (photos & videos)  
-✅ Upload to Telegram with metadata
-✅ Progress tracking and statistics
-✅ Stop/resume functionality
-✅ Year-wise organization
-
-*Privacy:* Files are processed temporarily and not stored.
-    """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.message.reply_text(
+        "📖 *How to use:*\n"
+        "1. Go to Snapchat → Settings → My Data\n"
+        "2. Request your data and download HTML file\n"
+        "3. Send that HTML file to me\n"
+        "4. I'll upload all your memories here\n\n"
+        "Commands: /start, /help, /stop, /status",
+        parse_mode='Markdown'
+    )
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop current processing"""
     user_session = get_user_session(update.effective_user.id)
-    
-    if not user_session.is_processing:
-        await update.message.reply_text("ℹ️ No active process to stop.")
-        return
-    
-    user_session.should_stop = True
-    await update.message.reply_text("🛑 Stopping process... Please wait.")
+    if user_session.is_processing:
+        user_session.should_stop = True
+        await update.message.reply_text("🛑 Stopping process...")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check current status"""
     user_session = get_user_session(update.effective_user.id)
-    
-    if not user_session.is_processing or user_session.processed_count == 0:
-        await update.message.reply_text("ℹ️ No active process running.")
-        return
-    
-    elapsed = time.time() - user_session.start_time
-    progress = user_session.processed_count
-    total = len(user_session.memories)
-    success = user_session.success_count
-    failed = user_session.failed_count
-    percentage = (progress / total) * 100 if total > 0 else 0
-    
-    status_text = f"""
-📊 *Current Status*
-
-🔢 Progress: {progress}/{total} ({percentage:.1f}%)
-✅ Successful: {success}
-❌ Failed: {failed}
-⏰ Elapsed: {int(elapsed)}s
-📁 Current: {user_session.current_file or 'None'}
-
-🛑 Use /stop to cancel
-    """
-    await update.message.reply_text(status_text, parse_mode='Markdown')
+    if user_session.is_processing:
+        progress = f"Progress: {user_session.processed_count}/{len(user_session.memories)}"
+        await update.message.reply_text(f"📊 {progress}\n✅ Success: {user_session.success_count}")
+    else:
+        await update.message.reply_text("ℹ️ No active process")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle received document (HTML file)."""
     user_session = get_user_session(update.effective_user.id)
     
     if user_session.is_processing:
-        await update.message.reply_text("⚠️ Please wait for current process to complete or use /stop to cancel.")
+        await update.message.reply_text("⚠️ Please wait for current process to complete")
         return
 
     document = update.message.document
-    
-    # Check if it's an HTML file
     if not document.file_name.lower().endswith('.html'):
-        await update.message.reply_text("❌ Please send an HTML file from Snapchat data export.")
+        await update.message.reply_text("❌ Please send an HTML file")
         return
 
-    # Download and process the file
     file = await context.bot.get_file(document.file_id)
     temp_path = None
     
@@ -420,233 +275,127 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(temp_path, 'r', encoding='utf-8') as f:
             html_content = f.read()
         
-        # Process the HTML file
         await process_snapchat_file(html_content, update, context, user_session)
         
     except Exception as e:
-        logger.error(f"Error handling document: {e}")
-        await update.message.reply_text(f"❌ Error processing file: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
     finally:
-        # Clean up temp file
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages."""
     user_session = get_user_session(update.effective_user.id)
     
-    # Check if this is a confirmation for large files
     if user_session.memories and len(user_session.memories) > 100:
         if update.message.text.lower() in ['yes', 'y', 'continue']:
             await start_upload_process(update, context, user_session)
             return
-        elif update.message.text.lower() in ['no', 'n', 'stop', 'cancel']:
-            await update.message.reply_text("❌ Process cancelled.")
+        elif update.message.text.lower() in ['no', 'n', 'stop']:
+            await update.message.reply_text("❌ Cancelled")
             user_session.reset()
             return
     
-    await update.message.reply_text(
-        "Please send me the HTML file you received from Snapchat data export.\n"
-        "Use /help for instructions on how to get your data."
-    )
+    await update.message.reply_text("Please send me your Snapchat HTML file")
 
 async def process_snapchat_file(html_content: str, update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession):
-    """Process the Snapchat HTML file and show statistics"""
     try:
-        # Step 1: Parse HTML
-        parsing_msg = await update.message.reply_text("🔍 Analyzing your Snapchat data file...")
+        await update.message.reply_text("🔍 Analyzing file...")
         
         user_session.memories = processor.parse_html_file(html_content)
         
         if not user_session.memories:
-            await parsing_msg.edit_text("❌ No memories found in the HTML file. Please make sure it's a valid Snapchat data export.")
+            await update.message.reply_text("❌ No memories found")
             return
         
-        # Step 2: Show statistics
         stats = processor.analyze_memories(user_session.memories)
-        stats_text = format_statistics(stats)
+        stats_text = f"✅ Found {stats['total']} memories!\n📊 Images: {stats['images']}, Videos: {stats['videos']}"
         
-        await parsing_msg.edit_text(stats_text)
+        await update.message.reply_text(stats_text)
         
-        # Ask for confirmation for large files
         if stats['total'] > 100:
-            confirm_msg = await update.message.reply_text(
-                f"⚠️ Found {stats['total']} memories. This may take a while.\n"
-                "Reply 'yes' to continue or 'no' to cancel."
-            )
+            await update.message.reply_text(f"⚠️ {stats['total']} memories found. Reply 'yes' to continue")
         else:
-            # Start immediately for small files
             await start_upload_process(update, context, user_session)
         
     except Exception as e:
-        logger.error(f"Error in process_snapchat_file: {e}")
-        await update.message.reply_text(f"❌ Unexpected error: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def start_upload_process(update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession):
-    """Start the upload process"""
     user_session.is_processing = True
     user_session.should_stop = False
     user_session.start_time = time.time()
     
     try:
-        # Step 3: Start processing
-        progress_msg = await update.message.reply_text(
-            "⏳ Starting upload process...\n\n"
-            "🛑 Use /stop to cancel anytime\n"
-            "📊 Use /status to check progress\n\n"
-            "⏰ This may take a while for large collections..."
-        )
+        progress_msg = await update.message.reply_text("⏳ Starting upload...")
         user_session.processing_message = progress_msg
         
-        # Create temporary directory for downloads
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Process memories one by one
             await process_memories_sequential(update, context, user_session, temp_dir)
         
-        # Final summary
         await send_final_summary(update, user_session)
         
     except Exception as e:
-        logger.error(f"Error in start_upload_process: {e}")
-        await update.message.reply_text(f"❌ Unexpected error: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
     finally:
         user_session.reset()
 
 async def process_memories_sequential(update: Update, context: ContextTypes.DEFAULT_TYPE, user_session: UserSession, temp_dir: str):
-    """Process memories one by one with proper tracking"""
-    total_memories = len(user_session.memories)
-    
-    # Create a single HTTP session for all requests
     async with aiohttp.ClientSession() as session:
         for i, memory in enumerate(user_session.memories):
             if user_session.should_stop:
-                await update.message.reply_text("🛑 Process stopped by user.")
+                await update.message.reply_text("🛑 Stopped")
                 break
             
             user_session.current_index = i + 1
-            user_session.current_file = f"{memory['date']} ({memory['media_type']})"
             
-            # Update progress
-            await update_progress_message(user_session, update)
+            # Update progress every 10 files
+            if i % 10 == 0:
+                progress = f"Progress: {i+1}/{len(user_session.memories)}"
+                await user_session.processing_message.edit_text(f"📤 Uploading...\n{progress}")
             
-            # Download memory
             downloaded_memory = await processor.download_memory(session, memory, temp_dir)
             
             if downloaded_memory:
-                # Upload to Telegram
                 success = await processor.upload_to_telegram(downloaded_memory, update, context)
-                
                 if success:
                     user_session.success_count += 1
-                    # Update stats
                     if 'image' in memory['media_type']:
                         user_session.stats['images'] += 1
-                    elif 'video' in memory['media_type']:
-                        user_session.stats['videos'] += 1
                     else:
-                        user_session.stats['other'] += 1
+                        user_session.stats['videos'] += 1
                 else:
                     user_session.failed_count += 1
-                    user_session.failed_memories.append(memory)
-                    logger.error(f"Failed to upload: {memory['date']}")
             else:
                 user_session.failed_count += 1
-                user_session.failed_memories.append(memory)
-                logger.error(f"Failed to download: {memory['date']}")
             
             user_session.processed_count += 1
+            await asyncio.sleep(1)  # Rate limiting
             
-            # Small delay to avoid rate limits (random between 1-3 seconds)
-            await asyncio.sleep(random.uniform(1, 3))
-            
-            # Clean up downloaded file
+            # Cleanup
             if downloaded_memory and 'filepath' in downloaded_memory:
                 try:
                     os.unlink(downloaded_memory['filepath'])
                 except:
                     pass
 
-async def update_progress_message(user_session: UserSession, update: Update):
-    """Update progress message"""
-    if not user_session.processing_message:
-        return
-        
-    current = user_session.current_index
-    total = len(user_session.memories)
-    success = user_session.success_count
-    failed = user_session.failed_count
-    percentage = (current / total) * 100 if total > 0 else 0
-    
-    progress_text = (
-        f"📤 Uploading memories...\n\n"
-        f"🔢 Progress: {current}/{total} ({percentage:.1f}%)\n"
-        f"✅ Successful: {success}\n"
-        f"❌ Failed: {failed}\n"
-        f"📊 Images: {user_session.stats['images']} | Videos: {user_session.stats['videos']}\n"
-        f"📁 Current: {user_session.current_file}\n\n"
-        f"🛑 Use /stop to cancel\n"
-        f"📊 Use /status for details"
-    )
-    
-    try:
-        await user_session.processing_message.edit_text(progress_text)
-    except Exception as e:
-        logger.warning(f"Could not update progress message: {e}")
-
-def format_statistics(stats: Dict) -> str:
-    """Format statistics for display"""
-    years_text = ""
-    if stats['years']:
-        years_sorted = sorted(stats['years'].items(), key=lambda x: x[0])
-        years_list = [f"{year}: {count}" for year, count in years_sorted]
-        years_text = f"📅 Years: {', '.join(years_list)}\n"
-    
-    return f"""
-✅ Found {stats['total']} memories!
-
-📊 Breakdown:
-• Images: {stats['images']}
-• Videos: {stats['videos']}
-• Other: {stats['other']}
-
-{years_text}
-🎯 Ready to start upload process?
-    """
-
 async def send_final_summary(update: Update, user_session: UserSession):
-    """Send final summary after processing"""
     elapsed = time.time() - user_session.start_time
-    total = len(user_session.memories)
-    success = user_session.success_count
-    failed = user_session.failed_count
-    
-    summary_text = f"""
-🎉 *Backup Complete!*
+    summary = f"""
+🎉 Backup Complete!
 
-📊 Final Statistics:
-✅ Total memories: {total}
-✅ Successfully uploaded: {success}
-❌ Failed: {failed}
-⏰ Time taken: {int(elapsed)} seconds
+📊 Statistics:
+✅ Total: {len(user_session.memories)}
+✅ Success: {user_session.success_count}
+❌ Failed: {user_session.failed_count}
+⏰ Time: {int(elapsed)}s
 
 📁 Breakdown:
 • Images: {user_session.stats['images']}
 • Videos: {user_session.stats['videos']}
-• Other: {user_session.stats['other']}
-
 """
+    await update.message.reply_text(summary)
 
-    if user_session.failed_memories:
-        summary_text += f"\n❌ Failed to upload {len(user_session.failed_memories)} memories."
-        if len(user_session.failed_memories) <= 10:
-            failed_list = "\n".join([f"• {m['date']} ({m['media_type']})" for m in user_session.failed_memories[:10]])
-            summary_text += f"\n\nFailed items:\n{failed_list}"
-    
-    summary_text += "\n\n💡 All successful memories are now safely stored in this chat!"
-    
-    await update.message.reply_text(summary_text, parse_mode='Markdown')
-
-# Add handlers to application only if it exists
+# Add handlers
 if application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
@@ -658,266 +407,85 @@ if application:
 # Flask routes
 @app.route('/')
 def index():
-    try:
-        # Get bot status info
-        bot_status = "Unknown"
-        bot_username = "Unknown"
-        bot_id = "Unknown"
-        
-        if application and application.bot:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                bot_info = loop.run_until_complete(application.bot.get_me())
-                bot_status = "✅ Connected"
-                bot_username = f"@{bot_info.username}"
-                bot_id = bot_info.id
-            except Exception as e:
-                bot_status = f"❌ Disconnected - {str(e)}"
-            finally:
-                loop.close()
-        
-        webhook_url = os.getenv('RENDER_EXTERNAL_URL', 'Not set')
-        
-        return f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Snapchat Memories Bot</title>
-    <meta charset="utf-8">
-    <style>
-        body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
-        .status {{ padding: 15px; border-radius: 5px; margin: 10px 0; }}
-        .connected {{ background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }}
-        .disconnected {{ background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }}
-        .info {{ background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }}
-        a {{ color: #007bff; text-decoration: none; }}
-        a:hover {{ text-decoration: underline; }}
-    </style>
-</head>
-<body>
-    <h1>🤖 Snapchat Memories Bot Status</h1>
+    bot_status = "❌ Not initialized"
+    if application and application.bot:
+        bot_status = "✅ Bot is running"
     
-    <div class="status {'connected' if '✅' in bot_status else 'disconnected'}">
-        <h3>📊 Bot Status: {bot_status}</h3>
-        <p><strong>🔗 Bot Username:</strong> {bot_username}</p>
-        <p><strong>🆔 Bot ID:</strong> {bot_id}</p>
-    </div>
-    
-    <div class="status info">
-        <h3>🌐 Webhook Information</h3>
-        <p><strong>Webhook URL:</strong> {webhook_url}/webhook</p>
-        <p><strong>Environment:</strong> {os.getenv('RENDER', 'Development')}</p>
-    </div>
-
-    <div class="status info">
-        <h3>💡 Usage Instructions</h3>
-        <ol>
-            <li>Send <code>/start</code> to your bot on Telegram</li>
-            <li>Upload your Snapchat HTML file</li>
-            <li>Wait for memories to be uploaded</li>
-        </ol>
-    </div>
-
-    <div class="status info">
-        <h3>🔧 Management Endpoints</h3>
-        <ul>
-            <li><a href="/health">/health</a> - Health check</li>
-            <li><a href="/set_webhook">/set_webhook</a> - Set webhook</li>
-            <li><a href="/webhook_info">/webhook_info</a> - Webhook info</li>
-            <li><a href="/delete_webhook">/delete_webhook</a> - Delete webhook</li>
-            <li><a href="/test_bot">/test_bot</a> - Test bot connection</li>
-        </ul>
-    </div>
-
-    <div class="status info">
-        <p><strong>📝 Note:</strong> Make sure TELEGRAM_BOT_TOKEN is set correctly in environment variables.</p>
-    </div>
-</body>
-</html>
-        """, 200, {'Content-Type': 'text/html; charset=utf-8'}
-    except Exception as e:
-        return f"Error generating status page: {str(e)}", 500
+    return f"""
+    <h1>Snapchat Memories Bot</h1>
+    <p>Status: {bot_status}</p>
+    <p><a href="/set_webhook">Set Webhook</a> | <a href="/health">Health</a></p>
+    """
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Webhook endpoint for Telegram"""
-    try:
-        if not application:
-            logger.error("Webhook received but bot not initialized")
-            return "Bot not initialized", 500
-            
-        json_str = request.get_data().decode('UTF-8')
-        update = Update.de_json(json.loads(json_str), application.bot)
-        application.update_queue.put(update)
-        return 'OK'
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return f"Error processing webhook: {str(e)}", 500
+    if not application:
+        return "Bot not initialized", 500
+        
+    json_str = request.get_data().decode('UTF-8')
+    update = Update.de_json(json.loads(json_str), application.bot)
+    application.update_queue.put(update)
+    return 'OK'
 
 @app.route('/health')
 def health():
     return 'OK'
 
-@app.route('/set_webhook', methods=['GET'])
+@app.route('/set_webhook')
 def set_webhook():
-    """Manually set webhook URL"""
-    try:
-        if not application:
-            return "Bot not initialized - check TELEGRAM_BOT_TOKEN", 500
-            
-        webhook_url = os.getenv('RENDER_EXTERNAL_URL')
-        if not webhook_url:
-            return "RENDER_EXTERNAL_URL environment variable not set", 500
+    if not application:
+        return "Bot not initialized", 500
         
-        # Run the async function in a new event loop
+    webhook_url = os.getenv('RENDER_EXTERNAL_URL')
+    if not webhook_url:
+        return "URL not set", 500
+    
+    # Run in background thread to avoid event loop issues
+    def set_webhook_thread():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
-        # First, delete any existing webhook
-        loop.run_until_complete(application.bot.delete_webhook())
-        
-        # Set new webhook
-        result = loop.run_until_complete(application.bot.set_webhook(
-            url=f"{webhook_url}/webhook",
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        ))
-        
-        loop.close()
-        
-        # Check if webhook was set successfully
-        if result:
-            return f"✅ Webhook set successfully to: {webhook_url}/webhook"
-        else:
-            return "❌ Failed to set webhook", 500
-            
-    except Exception as e:
-        logger.error(f"Error setting webhook: {e}")
-        return f"Error setting webhook: {str(e)}", 500
-
-@app.route('/delete_webhook', methods=['GET'])
-def delete_webhook():
-    """Delete webhook URL"""
-    try:
-        if not application:
-            return "Bot not initialized", 500
-            
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(application.bot.delete_webhook())
-        loop.close()
-        
-        if result:
-            return "✅ Webhook deleted successfully"
-        else:
-            return "❌ Failed to delete webhook", 500
-            
-    except Exception as e:
-        logger.error(f"Error deleting webhook: {e}")
-        return f"Error deleting webhook: {str(e)}", 500
-
-@app.route('/webhook_info', methods=['GET'])
-def webhook_info():
-    """Get webhook info"""
-    try:
-        if not application:
-            return "Bot not initialized", 500
-            
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        webhook_info = loop.run_until_complete(application.bot.get_webhook_info())
-        loop.close()
-        
-        return {
-            "url": webhook_info.url,
-            "has_custom_certificate": webhook_info.has_custom_certificate,
-            "pending_update_count": webhook_info.pending_update_count,
-            "last_error_date": webhook_info.last_error_date,
-            "last_error_message": webhook_info.last_error_message,
-            "max_connections": webhook_info.max_connections,
-            "allowed_updates": webhook_info.allowed_updates
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting webhook info: {e}")
-        return f"Error getting webhook info: {str(e)}", 500
-
-@app.route('/test_bot', methods=['GET'])
-def test_bot():
-    """Test bot connection"""
-    try:
-        if not application:
-            return "❌ Bot application not initialized", 500
-            
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Test bot connection
-        connected, message = loop.run_until_complete(check_bot_connection())
-        loop.close()
-        
-        return message
-    except Exception as e:
-        return f"❌ Test failed: {str(e)}", 500
-
-# Initialize the bot when the app starts
-def initialize_bot():
-    """Initialize the bot when the app starts"""
-    try:
-        if not BOT_TOKEN:
-            print("⚠️ Skipping bot initialization - no TELEGRAM_BOT_TOKEN")
-            return
-            
-        webhook_url = os.getenv('RENDER_EXTERNAL_URL')
-        if webhook_url:
-            print(f"🚀 Setting up webhook for: {webhook_url}")
-            # Set webhook for production
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Check bot connection first
-            connected, connection_msg = loop.run_until_complete(check_bot_connection())
-            print(connection_msg)
-            
-            if not connected:
-                print("❌ Cannot set webhook - bot connection failed")
-                return
-            
-            # Delete any existing webhook first
+        try:
             loop.run_until_complete(application.bot.delete_webhook())
-            
-            # Set new webhook
             result = loop.run_until_complete(application.bot.set_webhook(
                 url=f"{webhook_url}/webhook",
-                allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True
             ))
+            print(f"Webhook set: {result}")
+        finally:
             loop.close()
-            
-            if result:
-                print(f"✅ Webhook set successfully: {webhook_url}/webhook")
-                print("🤖 Bot is now ready to receive messages!")
-            else:
-                print("❌ Failed to set webhook")
-        else:
-            print("ℹ️ Running in development mode (no webhook set)")
-            # Check connection in dev mode too
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            connected, connection_msg = loop.run_until_complete(check_bot_connection())
-            print(connection_msg)
-            loop.close()
-    except Exception as e:
-        print(f"❌ Failed to initialize bot: {e}")
+    
+    thread = threading.Thread(target=set_webhook_thread)
+    thread.start()
+    thread.join()
+    
+    return f"Webhook set to: {webhook_url}/webhook"
 
-# Initialize the bot immediately when the module is imported
-print("🤖 Initializing Snapchat Memories Bot...")
-initialize_bot()
+# Initialize webhook on startup
+if application and os.getenv('RENDER_EXTERNAL_URL'):
+    print("🚀 Setting up webhook...")
+    webhook_url = os.getenv('RENDER_EXTERNAL_URL')
+    
+    def init_webhook():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(application.bot.delete_webhook())
+            result = loop.run_until_complete(application.bot.set_webhook(
+                url=f"{webhook_url}/webhook",
+                drop_pending_updates=True
+            ))
+            print(f"✅ Webhook set: {result}")
+        except Exception as e:
+            print(f"❌ Webhook setup failed: {e}")
+        finally:
+            loop.close()
+    
+    # Run in background
+    import threading
+    thread = threading.Thread(target=init_webhook)
+    thread.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"🤖 Starting Snapchat Memories Bot on port {port}...")
-    
-    # Run the Flask app
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print(f"🤖 Starting bot on port {port}")
+    app.run(host='0.0.0.0', port=port)
