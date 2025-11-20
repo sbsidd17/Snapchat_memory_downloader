@@ -287,6 +287,18 @@ except Exception as e:
     application = None
     processor = SnapchatMemoryProcessor()
 
+async def check_bot_connection():
+    """Check if bot can connect to Telegram API"""
+    try:
+        if not application or not application.bot:
+            return False, "Bot not initialized"
+        
+        # Test API connection by getting bot info
+        bot_info = await application.bot.get_me()
+        return True, f"✅ Bot connected as: @{bot_info.username} (ID: {bot_info.id})"
+    except Exception as e:
+        return False, f"❌ Bot connection failed: {str(e)}"
+
 def get_user_session(user_id: int) -> UserSession:
     """Get or create user session"""
     if user_id not in user_sessions:
@@ -646,13 +658,93 @@ if application:
 # Flask routes
 @app.route('/')
 def index():
-    return "🤖 Snapchat Memories Bot is running! Send /start to your bot on Telegram."
+    try:
+        # Get bot status info
+        bot_status = "Unknown"
+        bot_username = "Unknown"
+        bot_id = "Unknown"
+        
+        if application and application.bot:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                bot_info = loop.run_until_complete(application.bot.get_me())
+                bot_status = "✅ Connected"
+                bot_username = f"@{bot_info.username}"
+                bot_id = bot_info.id
+            except Exception as e:
+                bot_status = f"❌ Disconnected - {str(e)}"
+            finally:
+                loop.close()
+        
+        webhook_url = os.getenv('RENDER_EXTERNAL_URL', 'Not set')
+        
+        return f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Snapchat Memories Bot</title>
+    <meta charset="utf-8">
+    <style>
+        body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
+        .status {{ padding: 15px; border-radius: 5px; margin: 10px 0; }}
+        .connected {{ background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }}
+        .disconnected {{ background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }}
+        .info {{ background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }}
+        a {{ color: #007bff; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+    </style>
+</head>
+<body>
+    <h1>🤖 Snapchat Memories Bot Status</h1>
+    
+    <div class="status {'connected' if '✅' in bot_status else 'disconnected'}">
+        <h3>📊 Bot Status: {bot_status}</h3>
+        <p><strong>🔗 Bot Username:</strong> {bot_username}</p>
+        <p><strong>🆔 Bot ID:</strong> {bot_id}</p>
+    </div>
+    
+    <div class="status info">
+        <h3>🌐 Webhook Information</h3>
+        <p><strong>Webhook URL:</strong> {webhook_url}/webhook</p>
+        <p><strong>Environment:</strong> {os.getenv('RENDER', 'Development')}</p>
+    </div>
+
+    <div class="status info">
+        <h3>💡 Usage Instructions</h3>
+        <ol>
+            <li>Send <code>/start</code> to your bot on Telegram</li>
+            <li>Upload your Snapchat HTML file</li>
+            <li>Wait for memories to be uploaded</li>
+        </ol>
+    </div>
+
+    <div class="status info">
+        <h3>🔧 Management Endpoints</h3>
+        <ul>
+            <li><a href="/health">/health</a> - Health check</li>
+            <li><a href="/set_webhook">/set_webhook</a> - Set webhook</li>
+            <li><a href="/webhook_info">/webhook_info</a> - Webhook info</li>
+            <li><a href="/delete_webhook">/delete_webhook</a> - Delete webhook</li>
+            <li><a href="/test_bot">/test_bot</a> - Test bot connection</li>
+        </ul>
+    </div>
+
+    <div class="status info">
+        <p><strong>📝 Note:</strong> Make sure TELEGRAM_BOT_TOKEN is set correctly in environment variables.</p>
+    </div>
+</body>
+</html>
+        """, 200, {'Content-Type': 'text/html; charset=utf-8'}
+    except Exception as e:
+        return f"Error generating status page: {str(e)}", 500
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Webhook endpoint for Telegram"""
     try:
         if not application:
+            logger.error("Webhook received but bot not initialized")
             return "Bot not initialized", 500
             
         json_str = request.get_data().decode('UTF-8')
@@ -751,6 +843,24 @@ def webhook_info():
         logger.error(f"Error getting webhook info: {e}")
         return f"Error getting webhook info: {str(e)}", 500
 
+@app.route('/test_bot', methods=['GET'])
+def test_bot():
+    """Test bot connection"""
+    try:
+        if not application:
+            return "❌ Bot application not initialized", 500
+            
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Test bot connection
+        connected, message = loop.run_until_complete(check_bot_connection())
+        loop.close()
+        
+        return message
+    except Exception as e:
+        return f"❌ Test failed: {str(e)}", 500
+
 # Initialize the bot when the app starts
 def initialize_bot():
     """Initialize the bot when the app starts"""
@@ -766,6 +876,14 @@ def initialize_bot():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
+            # Check bot connection first
+            connected, connection_msg = loop.run_until_complete(check_bot_connection())
+            print(connection_msg)
+            
+            if not connected:
+                print("❌ Cannot set webhook - bot connection failed")
+                return
+            
             # Delete any existing webhook first
             loop.run_until_complete(application.bot.delete_webhook())
             
@@ -779,10 +897,17 @@ def initialize_bot():
             
             if result:
                 print(f"✅ Webhook set successfully: {webhook_url}/webhook")
+                print("🤖 Bot is now ready to receive messages!")
             else:
                 print("❌ Failed to set webhook")
         else:
             print("ℹ️ Running in development mode (no webhook set)")
+            # Check connection in dev mode too
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            connected, connection_msg = loop.run_until_complete(check_bot_connection())
+            print(connection_msg)
+            loop.close()
     except Exception as e:
         print(f"❌ Failed to initialize bot: {e}")
 
